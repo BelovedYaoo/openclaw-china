@@ -137,10 +137,191 @@ function jsonOk(res: ServerResponse, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-async function readJsonBody(req: IncomingMessage, maxBytes: number) {
+/**
+ * 从 XML 字符串中提取指定标签的文本内容。
+ * 支持 CDATA 和普通文本两种形式。
+ */
+function extractXmlTag(xml: string, tag: string): string | undefined {
+  if (!xml || !tag) return undefined;
+  const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`<${escapedTag}(?:\\s[^>]*)?>([\\s\\S]*?)</${escapedTag}>`, "i");
+  const m = re.exec(xml);
+  if (!m) return undefined;
+
+  const body = m[1] ?? "";
+  const cdata = /^<!\[CDATA\[([\s\S]*?)\]\]>$/i.exec(body.trim());
+  if (cdata) return cdata[1] ?? "";
+
+  return body;
+}
+
+function extractXmlTagAll(xml: string, tag: string): string[] {
+  if (!xml || !tag) return [];
+  const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`<${escapedTag}(?:\\s[^>]*)?>([\\s\\S]*?)</${escapedTag}>`, "gi");
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    const body = m[1] ?? "";
+    const cdata = /^<!\[CDATA\[([\s\S]*?)\]\]>$/i.exec(body.trim());
+    out.push(cdata ? (cdata[1] ?? "") : body);
+  }
+  return out;
+}
+
+function pickFirstNonEmpty(...values: Array<string | undefined>): string {
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (trimmed) return trimmed;
+  }
+  return "";
+}
+
+function parseXmlTextPayload(xml: string): { content: string } | undefined {
+  const textBlock = extractXmlTag(xml, "Text") ?? "";
+  const content = pickFirstNonEmpty(
+    extractXmlTag(textBlock, "Content"),
+    extractXmlTag(xml, "Content")
+  );
+  if (!content) return undefined;
+  return { content };
+}
+
+function parseXmlVoicePayload(xml: string): Record<string, unknown> | undefined {
+  const voiceBlock = extractXmlTag(xml, "Voice") ?? "";
+  const content = pickFirstNonEmpty(
+    extractXmlTag(voiceBlock, "Content"),
+    extractXmlTag(voiceBlock, "Recognition"),
+    extractXmlTag(xml, "Recognition"),
+    extractXmlTag(xml, "Content")
+  );
+  const url = pickFirstNonEmpty(
+    extractXmlTag(voiceBlock, "Url"),
+    extractXmlTag(voiceBlock, "VoiceUrl"),
+    extractXmlTag(xml, "VoiceUrl")
+  );
+  const mediaId = pickFirstNonEmpty(
+    extractXmlTag(voiceBlock, "MediaId"),
+    extractXmlTag(xml, "MediaId")
+  );
+
+  if (!content && !url && !mediaId) return undefined;
+
+  const voice: Record<string, unknown> = {};
+  if (content) voice.content = content;
+  if (url) voice.url = url;
+  if (mediaId) voice.media_id = mediaId;
+  return voice;
+}
+
+function parseXmlImagePayload(xml: string): Record<string, unknown> | undefined {
+  const imageBlock = extractXmlTag(xml, "Image") ?? "";
+  const url = pickFirstNonEmpty(
+    extractXmlTag(imageBlock, "Url"),
+    extractXmlTag(imageBlock, "PicUrl"),
+    extractXmlTag(xml, "PicUrl"),
+    extractXmlTag(xml, "Url")
+  );
+  const mediaId = pickFirstNonEmpty(
+    extractXmlTag(imageBlock, "MediaId"),
+    extractXmlTag(xml, "MediaId")
+  );
+
+  if (!url && !mediaId) return undefined;
+
+  const image: Record<string, unknown> = {};
+  if (url) image.url = url;
+  if (mediaId) image.media_id = mediaId;
+  return image;
+}
+
+function parseXmlFilePayload(xml: string): Record<string, unknown> | undefined {
+  const fileBlock = extractXmlTag(xml, "File") ?? "";
+  const url = pickFirstNonEmpty(
+    extractXmlTag(fileBlock, "Url"),
+    extractXmlTag(fileBlock, "FileUrl"),
+    extractXmlTag(xml, "FileUrl"),
+    extractXmlTag(xml, "Url")
+  );
+  const fileName = pickFirstNonEmpty(
+    extractXmlTag(fileBlock, "FileName"),
+    extractXmlTag(fileBlock, "Name"),
+    extractXmlTag(xml, "FileName")
+  );
+  const mediaId = pickFirstNonEmpty(
+    extractXmlTag(fileBlock, "MediaId"),
+    extractXmlTag(xml, "MediaId")
+  );
+
+  if (!url && !fileName && !mediaId) return undefined;
+
+  const file: Record<string, unknown> = {};
+  if (url) file.url = url;
+  if (fileName) file.filename = fileName;
+  if (mediaId) file.media_id = mediaId;
+  return file;
+}
+
+function parseXmlMixedItems(xml: string): Array<Record<string, unknown>> {
+  const mixedBlock = extractXmlTag(xml, "Mixed");
+  if (!mixedBlock) return [];
+
+  const itemBlocks = [
+    ...extractXmlTagAll(mixedBlock, "MsgItem"),
+    ...extractXmlTagAll(mixedBlock, "msg_item"),
+  ];
+  if (itemBlocks.length === 0) return [];
+
+  const items: Array<Record<string, unknown>> = [];
+  for (const itemBlock of itemBlocks) {
+    const itemType = pickFirstNonEmpty(
+      extractXmlTag(itemBlock, "MsgType"),
+      extractXmlTag(itemBlock, "msgtype"),
+      extractXmlTag(itemBlock, "Type")
+    ).toLowerCase();
+    if (!itemType) continue;
+
+    if (itemType === "text") {
+      const text = parseXmlTextPayload(itemBlock);
+      items.push({ msgtype: "text", text: text ?? { content: "" } });
+      continue;
+    }
+
+    if (itemType === "image") {
+      const image = parseXmlImagePayload(itemBlock);
+      if (image) items.push({ msgtype: "image", image });
+      else items.push({ msgtype: "image" });
+      continue;
+    }
+
+    if (itemType === "file") {
+      const file = parseXmlFilePayload(itemBlock);
+      if (file) items.push({ msgtype: "file", file });
+      else items.push({ msgtype: "file" });
+      continue;
+    }
+
+    if (itemType === "voice") {
+      const voice = parseXmlVoicePayload(itemBlock);
+      if (voice) items.push({ msgtype: "voice", voice });
+      else items.push({ msgtype: "voice" });
+      continue;
+    }
+
+    items.push({ msgtype: itemType });
+  }
+
+  return items;
+}
+
+/**
+ * 读取请求体并解析为统一的 Record 对象。
+ * 同时支持 JSON 和 XML（企微回调标准格式）两种格式。
+ */
+async function readRequestBody(req: IncomingMessage, maxBytes: number) {
   const chunks: Buffer[] = [];
   let total = 0;
-  return await new Promise<{ ok: boolean; value?: unknown; error?: string }>((resolve) => {
+  return await new Promise<{ ok: boolean; value?: unknown; raw?: string; error?: string }>((resolve) => {
     req.on("data", (chunk: Buffer) => {
       total += chunk.length;
       if (total > maxBytes) {
@@ -157,7 +338,18 @@ async function readJsonBody(req: IncomingMessage, maxBytes: number) {
           resolve({ ok: false, error: "empty payload" });
           return;
         }
-        resolve({ ok: true, value: JSON.parse(raw) as unknown });
+        const trimmed = raw.trim();
+        // 企微回调的消息体是 XML 格式：<xml><Encrypt>...</Encrypt></xml>
+        if (trimmed.startsWith("<")) {
+          const encrypt = pickFirstNonEmpty(extractXmlTag(trimmed, "Encrypt"));
+          if (encrypt) {
+            resolve({ ok: true, value: { Encrypt: encrypt }, raw });
+          } else {
+            resolve({ ok: false, raw, error: "xml body missing Encrypt tag" });
+          }
+          return;
+        }
+        resolve({ ok: true, value: JSON.parse(raw) as unknown, raw });
       } catch (err) {
         resolve({ ok: false, error: err instanceof Error ? err.message : String(err) });
       }
@@ -238,12 +430,131 @@ function createStreamId(): string {
   return crypto.randomBytes(16).toString("hex");
 }
 
+/**
+ * 解析解密后的企微消息明文。
+ * 企微群机器人回调的明文是 XML 格式，需要从 XML 中提取各字段映射为 WecomInboundMessage。
+ * 同时兼容 JSON 格式。
+ */
 function parseWecomPlainMessage(raw: string): WecomInboundMessage {
-  const parsed = JSON.parse(raw) as unknown;
-  if (!parsed || typeof parsed !== "object") {
-    return {};
+  const trimmed = raw.trim();
+
+  // XML 格式：企微群机器人回调的标准格式
+  if (trimmed.startsWith("<")) {
+    return parseWecomXmlMessage(trimmed);
   }
-  return parsed as WecomInboundMessage;
+
+  // JSON 格式：兼容其他可能的回调场景
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+    return parsed as WecomInboundMessage;
+  } catch {
+    return parseWecomXmlMessage(trimmed);
+  }
+}
+
+/**
+ * 从企微 XML 明文中提取字段，映射为 WecomInboundMessage 对象。
+ *
+ * 企微群机器人回调 XML 结构示例：
+ * <xml>
+ *   <From><UserId>xxx</UserId><Name>xxx</Name><Alias>xxx</Alias></From>
+ *   <WebhookUrl>http://...</WebhookUrl>
+ *   <ChatId>xxx</ChatId>
+ *   <GetChatInfoUrl>http://...</GetChatInfoUrl>
+ *   <MsgId>xxx</MsgId>
+ *   <ChatType>group</ChatType>
+ *   <MsgType>text</MsgType>
+ *   <Text><Content>消息内容</Content></Text>
+ * </xml>
+ */
+function parseWecomXmlMessage(xml: string): WecomInboundMessage {
+  const msgtype = pickFirstNonEmpty(
+    extractXmlTag(xml, "MsgType"),
+    extractXmlTag(xml, "msgtype")
+  ).toLowerCase();
+  const chattype = pickFirstNonEmpty(
+    extractXmlTag(xml, "ChatType"),
+    extractXmlTag(xml, "chattype")
+  ).toLowerCase();
+  const chatid = pickFirstNonEmpty(
+    extractXmlTag(xml, "ChatId"),
+    extractXmlTag(xml, "chatid")
+  );
+  const msgid = pickFirstNonEmpty(
+    extractXmlTag(xml, "MsgId"),
+    extractXmlTag(xml, "msgid")
+  );
+  const webhookUrl = pickFirstNonEmpty(
+    extractXmlTag(xml, "WebhookUrl"),
+    extractXmlTag(xml, "response_url")
+  );
+
+  // 提取发送者信息：<From><UserId>xxx</UserId></From>
+  const fromBlock = extractXmlTag(xml, "From") ?? "";
+  const userid = pickFirstNonEmpty(
+    extractXmlTag(fromBlock, "UserId"),
+    extractXmlTag(xml, "FromUserName"),
+    extractXmlTag(xml, "UserId")
+  );
+
+  // 构建基础消息对象
+  const result: Record<string, unknown> = {
+    msgtype,
+    chattype: chattype === "group" ? "group" : "single",
+    chatid,
+    msgid,
+    from: { userid },
+  };
+
+  // 如果有 WebhookUrl，作为 response_url 使用
+  if (webhookUrl) {
+    result.response_url = webhookUrl;
+  }
+
+  // 根据消息类型提取对应内容
+  if (msgtype === "text") {
+    result.text = parseXmlTextPayload(xml) ?? { content: "" };
+  } else if (msgtype === "voice") {
+    result.voice = parseXmlVoicePayload(xml) ?? { content: "" };
+  } else if (msgtype === "image") {
+    const image = parseXmlImagePayload(xml);
+    if (image) result.image = image;
+  } else if (msgtype === "file") {
+    const file = parseXmlFilePayload(xml);
+    if (file) result.file = file;
+  } else if (msgtype === "stream") {
+    const streamBlock = extractXmlTag(xml, "Stream") ?? "";
+    const id = pickFirstNonEmpty(
+      extractXmlTag(streamBlock, "Id"),
+      extractXmlTag(xml, "StreamId"),
+      extractXmlTag(xml, "Id")
+    );
+    result.stream = { id };
+  } else if (msgtype === "event") {
+    const eventBlock = extractXmlTag(xml, "Event") ?? "";
+    const eventtype = pickFirstNonEmpty(
+      extractXmlTag(eventBlock, "EventType"),
+      extractXmlTag(xml, "EventType"),
+      extractXmlTag(xml, "Event")
+    );
+    result.event = { eventtype };
+  } else if (msgtype === "mixed") {
+    const mixedItems = parseXmlMixedItems(xml);
+    if (mixedItems.length > 0) {
+      result.mixed = { msg_item: mixedItems };
+    }
+
+    // 兼容某些 mixed 载荷只有一个 Text 节点时的兜底字段
+    const text = parseXmlTextPayload(xml);
+    if (text) {
+      result.text = text;
+    }
+  }
+
+  return result as WecomInboundMessage;
 }
 
 async function waitForStreamContent(streamId: string, maxWaitMs: number): Promise<void> {
@@ -457,14 +768,17 @@ export async function handleWecomWebhookRequest(req: IncomingMessage, res: Serve
     }
 
     const target = targets.find((candidate) => {
-      if (!candidate.account.configured || !candidate.account.token) return false;
-      return verifyWecomSignature({
+      if (!candidate.account.configured || !candidate.account.token) {
+        return false;
+      }
+      const ok = verifyWecomSignature({
         token: candidate.account.token,
         timestamp,
         nonce,
         encrypt: echostr,
         signature,
       });
+      return ok;
     });
 
     if (!target || !target.account.encodingAESKey) {
@@ -505,12 +819,14 @@ export async function handleWecomWebhookRequest(req: IncomingMessage, res: Serve
     return true;
   }
 
-  const body = await readJsonBody(req, 1024 * 1024);
+  const body = await readRequestBody(req, 1024 * 1024);
   if (!body.ok) {
     res.statusCode = body.error === "payload too large" ? 413 : 400;
     res.end(body.error ?? "invalid payload");
     return true;
   }
+
+  // ===== 调试日志：记录完整的请求体 =====
 
   const record = body.value && typeof body.value === "object" ? (body.value as Record<string, unknown>) : null;
   const encrypt = record ? String(record.encrypt ?? record.Encrypt ?? "") : "";
@@ -520,15 +836,19 @@ export async function handleWecomWebhookRequest(req: IncomingMessage, res: Serve
     return true;
   }
 
+
   const target = targets.find((candidate) => {
-    if (!candidate.account.token) return false;
-    return verifyWecomSignature({
+    if (!candidate.account.token) {
+      return false;
+    }
+    const ok = verifyWecomSignature({
       token: candidate.account.token,
       timestamp,
       nonce,
       encrypt,
       signature,
     });
+    return ok;
   });
 
   if (!target) {
@@ -558,6 +878,8 @@ export async function handleWecomWebhookRequest(req: IncomingMessage, res: Serve
     return true;
   }
 
+  // ===== 调试日志：记录解密后的明文 =====
+
   const msg = parseWecomPlainMessage(plain);
   target.statusSink?.({ lastInboundAt: Date.now() });
 
@@ -577,15 +899,13 @@ export async function handleWecomWebhookRequest(req: IncomingMessage, res: Serve
           finished: true,
           content: "",
         });
-    jsonOk(
-      res,
-      buildEncryptedJsonReply({
-        account: target.account,
-        plaintextJson: reply,
-        nonce,
-        timestamp,
-      })
-    );
+    const encReply = buildEncryptedJsonReply({
+      account: target.account,
+      plaintextJson: reply,
+      nonce,
+      timestamp,
+    });
+    jsonOk(res, encReply);
     return true;
   }
 
@@ -753,15 +1073,13 @@ export async function handleWecomWebhookRequest(req: IncomingMessage, res: Serve
     ? buildStreamReplyFromState(state)
     : buildStreamPlaceholderReply(streamId);
 
-  jsonOk(
-    res,
-    buildEncryptedJsonReply({
-      account: target.account,
-      plaintextJson: initialReply,
-      nonce,
-      timestamp,
-    })
-  );
+  const encReply = buildEncryptedJsonReply({
+    account: target.account,
+    plaintextJson: initialReply,
+    nonce,
+    timestamp,
+  });
+  jsonOk(res, encReply);
 
   return true;
 }
